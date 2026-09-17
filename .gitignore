@@ -219,3 +219,7 @@ __marimo__/
 
 # Local Baidu debug captures
 *.html
+
+
+credentials.json
+token.json
