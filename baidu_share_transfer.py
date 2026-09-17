@@ -243,7 +243,7 @@ def verify_share(
     return sekey
 
 
-def list_files(
+def list_directory(
     client: httpx.Client,
     sekey: str,
     share_uk: str,
@@ -252,46 +252,216 @@ def list_files(
     dir_path: str,
 ) -> list[dict]:
 
-    print("\n=== SHARE LIST ===")
-    print("dir:", dir_path)
+    all_items: list[dict] = []
+    page = 1
+    page_size = 100
 
-    response = client.get(
-        SHARE_LIST_URL,
-        params={
-            "is_from_web": "true",
-            "sekey": sekey,
-            "uk": share_uk,
-            "shareid": share_id,
-            "order": "name",
-            "desc": "0",
-            "showempty": "0",
-            "web": "1",
-            "page": "1",
-            "num": "100",
-            "dir": dir_path,
-            "channel": "chunlei",
-            "app_id": "250528",
-            "bdstoken": bdstoken,
-            "clienttype": "0",
-        },
-    )
-
-    print("status:", response.status_code)
-
-    data = response.json()
-
-    print("errno:", data.get("errno"))
-
-    if data.get("errno") != 0:
-        raise RuntimeError(
-            f"Share list failed: {data}"
+    while True:
+        print(
+            f"Listing: {dir_path} "
+            f"(page {page})"
         )
 
-    items = data.get("list", [])
+        response = client.get(
+            SHARE_LIST_URL,
+            params={
+                "is_from_web": "true",
+                "sekey": sekey,
+                "uk": share_uk,
+                "shareid": share_id,
+                "order": "name",
+                "desc": "0",
+                "showempty": "0",
+                "web": "1",
+                "page": str(page),
+                "num": str(page_size),
+                "dir": dir_path,
+                "channel": "chunlei",
+                "app_id": "250528",
+                "bdstoken": bdstoken,
+                "clienttype": "0",
+            },
+        )
 
-    print("items:", len(items))
+        response.raise_for_status()
 
-    return items
+        data = response.json()
+
+        if data.get("errno") != 0:
+            raise RuntimeError(
+                f"Share list failed "
+                f"for {dir_path}, "
+                f"page {page}: {data}"
+            )
+
+        items = data.get("list", [])
+
+        print(
+            f"  items: {len(items)}"
+        )
+
+        all_items.extend(items)
+
+        if len(items) < page_size:
+            break
+
+        page += 1
+
+    return all_items
+
+def list_all_files(
+    client: httpx.Client,
+    sekey: str,
+    share_uk: str,
+    share_id: str,
+    bdstoken: str,
+    root_path: str,
+) -> tuple[list[dict], list[str]]:
+
+    all_files: list[dict] = []
+    all_directories: list[str] = []
+
+    visited_directories: set[str] = set()
+    seen_files: set[int] = set()
+
+    def walk(
+        dir_path: str,
+        depth: int = 0,
+    ) -> None:
+
+        if dir_path in visited_directories:
+            return
+
+        visited_directories.add(
+            dir_path
+        )
+
+        all_directories.append(
+            dir_path
+        )
+
+        indent = "  " * depth
+
+        print(
+            f"{indent}[DIR] {dir_path}"
+        )
+
+        items = list_directory(
+            client=client,
+            sekey=sekey,
+            share_uk=share_uk,
+            share_id=share_id,
+            bdstoken=bdstoken,
+            dir_path=dir_path,
+        )
+
+        for item in items:
+
+            is_dir = (
+                int(item.get("isdir", 0))
+                == 1
+            )
+
+            path = item.get(
+                "path",
+                "",
+            )
+
+            filename = item.get(
+                "server_filename",
+                "",
+            )
+
+            if is_dir:
+                print(
+                    f"{indent}  "
+                    f"[DIR] {filename}"
+                )
+
+                if not path:
+                    raise RuntimeError(
+                        "Directory item "
+                        "does not contain path: "
+                        f"{item}"
+                    )
+
+                walk(
+                    path,
+                    depth + 1,
+                )
+
+                continue
+
+            fs_id = int(
+                item["fs_id"]
+            )
+
+            if fs_id in seen_files:
+                continue
+
+            seen_files.add(
+                fs_id
+            )
+
+            file_info = {
+                "fs_id": fs_id,
+                "server_filename": (
+                    filename
+                ),
+                "path": path,
+                "size": int(
+                    item.get(
+                        "size",
+                        0,
+                    )
+                ),
+            }
+
+            all_files.append(
+                file_info
+            )
+
+            print(
+                f"{indent}  "
+                f"[FILE] {filename} "
+                f"({format_bytes(file_info['size'])})"
+            )
+
+    walk(root_path)
+
+    return (
+        all_files,
+        all_directories,
+    )
+
+
+def format_bytes(
+    size: int,
+) -> str:
+
+    value = float(size)
+
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB",
+    ]
+
+    for unit in units:
+
+        if (
+            value < 1024
+            or unit == units[-1]
+        ):
+            return (
+                f"{value:.2f} {unit}"
+            )
+
+        value /= 1024
+
+    return f"{size} B"
 
 
 def find_first_file(
@@ -581,77 +751,68 @@ def main() -> None:
         )
 
         # ----------------------------------------------
-        # List files
+        # Recursive listing
         # ----------------------------------------------
 
-        items = list_files(
-            client=client,
-            sekey=sekey,
-            share_uk=metadata["share_uk"],
-            share_id=metadata["share_id"],
-            bdstoken=metadata["bdstoken"],
-            dir_path=metadata["root_path"],
-        )
-
-        file_info = find_first_file(
-            items
-        )
-
-        print("\n=== SELECTED FILE ===")
-
         print(
-            "filename:",
-            file_info["server_filename"],
+            "\n=== RECURSIVE LISTING ==="
         )
 
-        print(
-            "fs_id:",
-            file_info["fs_id"],
-        )
-
-        print(
-            "size:",
-            file_info["size"],
-        )
-
-        # ----------------------------------------------
-        # Fresh download config
-        # ----------------------------------------------
-
-        sign, timestamp = (
-            get_download_config(
+        all_files, all_directories = (
+            list_all_files(
                 client=client,
-                raw_surl=raw_surl,
+                sekey=sekey,
+                share_uk=metadata[
+                    "share_uk"
+                ],
+                share_id=metadata[
+                    "share_id"
+                ],
                 bdstoken=metadata[
                     "bdstoken"
+                ],
+                root_path=metadata[
+                    "root_path"
                 ],
             )
         )
 
         # ----------------------------------------------
-        # Generate dlink
+        # Summary
         # ----------------------------------------------
 
-        dlink = get_download_link(
-            client=client,
-            file_info=file_info,
-            sign=sign,
-            timestamp=timestamp,
-            bdstoken=metadata["bdstoken"],
-            js_token=metadata["js_token"],
-            sekey=sekey,
-            share_uk=metadata["share_uk"],
-            share_id=metadata["share_id"],
+        total_size = sum(
+            file_info["size"]
+            for file_info in all_files
         )
 
-        # ----------------------------------------------
-        # Download
-        # ----------------------------------------------
+        print(
+            "\n=== SUMMARY ==="
+        )
 
-        download_file(
-            client=client,
-            dlink=dlink,
-            file_info=file_info,
+        print(
+            "root:",
+            metadata["root_path"],
+        )
+
+        print(
+            "directories:",
+            len(all_directories),
+        )
+
+        print(
+            "files:",
+            len(all_files),
+        )
+
+        print(
+            "total bytes:",
+            total_size,
+        )
+
+        print(
+            "total size:",
+            format_bytes(total_size),
         )
 
 
