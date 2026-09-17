@@ -598,6 +598,79 @@ def get_download_link(
 
     return files[0]["dlink"]
 
+def get_download_links(
+    client: httpx.Client,
+    file_infos: list[dict],
+    sign: str,
+    timestamp: int,
+    bdstoken: str,
+    js_token: str,
+    sekey: str,
+    share_uk: str,
+    share_id: str,
+) -> list[dict]:
+
+    print("\n=== BATCH SHARED DOWNLOAD ===")
+
+    fs_ids = [
+        file_info["fs_id"]
+        for file_info in file_infos
+    ]
+
+    print("files:", len(fs_ids))
+    print("fs_ids:", fs_ids)
+
+    response = client.post(
+        DOWNLOAD_API,
+        params={
+            "sign": sign,
+            "timestamp": timestamp,
+            "channel": "chunlei",
+            "web": "1",
+            "app_id": "250528",
+            "bdstoken": bdstoken,
+            "clienttype": "0",
+            "jsToken": js_token,
+        },
+        data={
+            "encrypt": "0",
+            "extra": json.dumps(
+                {"sekey": sekey},
+                separators=(",", ":"),
+            ),
+            "product": "share",
+            "uk": share_uk,
+            "primaryid": share_id,
+            "fid_list": json.dumps(fs_ids),
+            "path_list": "",
+            "vip": "0",
+        },
+    )
+
+    print("status:", response.status_code)
+
+    data = response.json()
+
+    print("errno:", data.get("errno"))
+
+    if data.get("errno") != 0:
+        raise RuntimeError(
+            f"Batch sharedownload failed: {data}"
+        )
+
+    files = data.get("list", [])
+
+    print("returned files:", len(files))
+
+    for item in files:
+        print(
+            "dlink:",
+            item.get("server_filename"),
+            "found" if item.get("dlink") else "missing",
+        )
+
+    return files
+
 
 def download_file(
     client: httpx.Client,
@@ -813,6 +886,53 @@ def main() -> None:
         print(
             "total size:",
             format_bytes(total_size),
+        )
+        
+        # ----------------------------------------------
+        # Two-file download test
+        # ----------------------------------------------
+
+        test_files = all_files[:2]
+
+        if len(test_files) < 2:
+            raise RuntimeError(
+                "Need at least 2 files for multi-file test"
+            )
+
+        print(
+            "\n=== TWO-FILE BATCH DLink TEST ==="
+        )
+
+        test_files = all_files[:2]
+
+        sign, timestamp = get_download_config(
+            client=client,
+            raw_surl=raw_surl,
+            bdstoken=metadata["bdstoken"],
+        )
+
+        download_items = get_download_links(
+            client=client,
+            file_infos=test_files,
+            sign=sign,
+            timestamp=timestamp,
+            bdstoken=metadata["bdstoken"],
+            js_token=metadata["js_token"],
+            sekey=sekey,
+            share_uk=metadata["share_uk"],
+            share_id=metadata["share_id"],
+        )
+
+        print("\n=== BATCH RESULT ===")
+
+        print(
+            "requested:",
+            len(test_files),
+        )
+
+        print(
+            "returned:",
+            len(download_items),
         )
 
 
