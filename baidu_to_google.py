@@ -75,6 +75,47 @@ def create_google_resumable_session(
     return upload_url
 
 
+def create_google_folder(
+    access_token: str,
+    folder_name: str,
+    parent_folder_id: str,
+) -> dict:
+    url = (
+        "https://www.googleapis.com/drive/v3/files"
+        "?fields=id,name,mimeType"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_folder_id],
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+
+    print("\n=== GOOGLE CREATE FOLDER ===")
+    print("status:", response.status_code)
+
+    response.raise_for_status()
+
+    folder = response.json()
+
+    print("name:", folder["name"])
+    print("id:", folder["id"])
+
+    return folder
+
+
 def stream_baidu_to_google(
     baidu_client: httpx.Client,
     dlink: str,
@@ -88,6 +129,7 @@ def stream_baidu_to_google(
     print("size:", file_size)
 
     uploaded = 0
+    downloaded = 0
     buffer = bytearray()
 
     with baidu_client.stream(
@@ -108,6 +150,20 @@ def stream_baidu_to_google(
             chunk_size=1024 * 1024
         ):
             buffer.extend(data)
+            downloaded += len(data)
+            if downloaded > file_size:
+                raise RuntimeError(
+                    "Baidu downloaded more bytes than expected: "
+                    f"file={filename}, "
+                    f"downloaded={downloaded}, "
+                    f"expected={file_size}"
+                )
+
+            print_transfer_progress(
+                downloaded=downloaded,
+                uploaded=uploaded,
+                total_size=file_size,
+            )
 
             while len(buffer) >= CHUNK_SIZE:
                 chunk = bytes(
@@ -125,12 +181,14 @@ def stream_baidu_to_google(
 
                 uploaded += len(chunk)
 
-                print_progress(
-                    uploaded,
-                    file_size,
+                print_transfer_progress(
+                    downloaded=downloaded,
+                    uploaded=uploaded,
+                    total_size=file_size,
                 )
 
                 if result is not None:
+                    print()
                     return result
 
         if buffer:
@@ -145,12 +203,14 @@ def stream_baidu_to_google(
 
             uploaded += len(chunk)
 
-            print_progress(
-                uploaded,
-                file_size,
+            print_transfer_progress(
+                downloaded=downloaded,
+                uploaded=uploaded,
+                total_size=file_size,
             )
 
             if result is not None:
+                print()
                 return result
 
     raise RuntimeError(
@@ -166,6 +226,12 @@ def upload_google_chunk(
 ) -> dict | None:
     end = start + len(chunk) - 1
 
+    print(
+        "\nGoogle PUT:",
+        f"bytes {start}-{end}/{total_size}",
+        f"chunk={len(chunk)}",
+    )
+
     response = requests.put(
         upload_url,
         headers={
@@ -180,6 +246,11 @@ def upload_google_chunk(
         timeout=120,
     )
 
+    print(
+        "Google status:",
+        response.status_code,
+    )
+    
     if response.status_code == 308:
         return None
 
@@ -196,20 +267,32 @@ def upload_google_chunk(
     )
 
 
-def print_progress(
+def print_transfer_progress(
+    downloaded: int,
     uploaded: int,
     total_size: int,
 ) -> None:
-    percent = (
+    download_percent = (
+        downloaded
+        / total_size
+        * 100
+    )
+
+    upload_percent = (
         uploaded
         / total_size
         * 100
     )
 
     print(
-        f"progress: "
-        f"{uploaded}/{total_size} "
-        f"({percent:.1f}%)"
+        "\r"
+        f"Baidu: {download_percent:6.1f}% "
+        f"| Google: {upload_percent:6.1f}% "
+        f"| "
+        f"{downloaded / 1024 / 1024:.1f}"
+        f"/{total_size / 1024 / 1024:.1f} MB",
+        end="",
+        flush=True,
     )
 
 
@@ -346,24 +429,39 @@ def main() -> None:
                 "No files found in Baidu share"
             )
 
-        # PoC: first file only
-        file_info = all_files[0]
+        # ----------------------------------------------
+        # Google root folder
+        # ----------------------------------------------
 
-        print(
-            "\n=== SELECTED FILE ==="
+        root_folder_name = (
+            metadata["root_path"]
+            .rstrip("/")
+            .split("/")[-1]
         )
 
-        print(
-            "filename:",
-            file_info[
-                "server_filename"
-            ],
+        google_root_folder = create_google_folder(
+            access_token=google_creds.token,
+            folder_name=root_folder_name,
+            parent_folder_id=google_folder_id,
         )
 
-        print(
-            "size:",
-            file_info["size"],
+        google_root_folder_id = (
+            google_root_folder["id"]
         )
+
+        # ----------------------------------------------
+        # PoC: first 3 files
+        # ----------------------------------------------
+
+        test_files = all_files[:3]
+
+        print("\n=== SELECTED FILES ===")
+
+        for file_info in test_files:
+            print(
+                file_info["server_filename"],
+                file_info["size"],
+            )
 
         # ----------------------------------------------
         # Baidu dlink
@@ -382,9 +480,7 @@ def main() -> None:
         download_items = (
             get_download_links(
                 client=client,
-                file_infos=[
-                    file_info,
-                ],
+                file_infos=test_files,
                 sign=sign,
                 timestamp=timestamp,
                 bdstoken=metadata[
@@ -402,92 +498,190 @@ def main() -> None:
                 ],
             )
         )
+        
+        for item in download_items:
+            print(
+                "download item:",
+                item.get("server_filename"),
+                item.get("fs_id"),
+            )
 
         if not download_items:
             raise RuntimeError(
                 "Baidu returned no download link"
             )
 
-        dlink = download_items[0].get(
-            "dlink"
-        )
+        # ----------------------------------------------
+        # Transfer selected files
+        # ----------------------------------------------
 
-        if not dlink:
+        if len(download_items) != len(test_files):
             raise RuntimeError(
-                "Baidu dlink missing"
+                "Baidu download link count mismatch: "
+                f"requested={len(test_files)}, "
+                f"returned={len(download_items)}"
             )
 
-        # ----------------------------------------------
-        # Google upload session
-        # ----------------------------------------------
+        download_items_by_fsid = {
+            str(item["fs_id"]): item
+            for item in download_items
+        }
 
-        filename = file_info[
-            "server_filename"
-        ]
-
-        file_size = int(
-            file_info["size"]
-        )
-
-        mime_type, _ = (
-            mimetypes.guess_type(
-                filename
-            )
-        )
-
-        if not mime_type:
-            mime_type = (
-                "application/octet-stream"
+        for index, file_info in enumerate(
+            test_files,
+            start=1,
+        ):
+            fs_id = str(
+                file_info["fs_id"]
             )
 
-        upload_url = (
-            create_google_resumable_session(
-                access_token=(
-                    google_creds.token
-                ),
-                folder_id=(
-                    google_folder_id
-                ),
+            download_item = (
+                download_items_by_fsid.get(
+                    fs_id
+                )
+            )
+
+            if not download_item:
+                raise RuntimeError(
+                    "Baidu download item missing: "
+                    f"fs_id={fs_id}, "
+                    f"file={file_info['server_filename']}"
+                )
+
+            filename = file_info[
+                "server_filename"
+            ]
+
+            file_size = int(
+                file_info["size"]
+            )
+
+            dlink = download_item.get(
+                "dlink"
+            )
+
+            if not dlink:
+                raise RuntimeError(
+                    f"Baidu dlink missing: {filename}"
+                )
+                
+            filename = file_info[
+                "server_filename"
+            ]
+
+            file_size = int(
+                file_info["size"]
+            )
+
+            dlink = download_item.get(
+                "dlink"
+            )
+
+            if not dlink:
+                raise RuntimeError(
+                    f"Baidu dlink missing: {filename}"
+                )
+
+            print(
+                "\n================================"
+            )
+            print(
+                f"TRANSFER {index}/{len(test_files)}"
+            )
+            print(
+                "filename:",
+                filename,
+            )
+            print(
+                "size:",
+                file_size,
+            )
+            print(
+                "================================"
+            )
+
+            mime_type, _ = (
+                mimetypes.guess_type(
+                    filename
+                )
+            )
+
+            if not mime_type:
+                mime_type = (
+                    "application/octet-stream"
+                )
+
+            # ------------------------------------------
+            # Google upload session
+            # ------------------------------------------
+
+            upload_url = (
+                create_google_resumable_session(
+                    access_token=(
+                        google_creds.token
+                    ),
+                    folder_id=(
+                        google_root_folder_id
+                    ),
+                    filename=filename,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                )
+            )
+
+            # ------------------------------------------
+            # Direct streaming
+            # ------------------------------------------
+
+            result = stream_baidu_to_google(
+                baidu_client=client,
+                dlink=dlink,
+                upload_url=upload_url,
                 filename=filename,
                 file_size=file_size,
-                mime_type=mime_type,
             )
-        )
 
-        # ----------------------------------------------
-        # Direct streaming
-        # ----------------------------------------------
+            print("\n=== FILE RESULT ===")
 
-        result = stream_baidu_to_google(
-            baidu_client=client,
-            dlink=dlink,
-            upload_url=upload_url,
-            filename=filename,
-            file_size=file_size,
-        )
+            print(
+                "id:",
+                result.get("id"),
+            )
 
-        print("\n=== RESULT ===")
+            print(
+                "name:",
+                result.get("name"),
+            )
+
+            print(
+                "size:",
+                result.get("size"),
+            )
+
+            print(
+                "webViewLink:",
+                result.get(
+                    "webViewLink"
+                ),
+            )
+
+            print(
+                f"Transfer {index}/"
+                f"{len(test_files)} OK"
+            )
 
         print(
-            "id:",
-            result.get("id"),
+            "\n=== TRANSFER COMPLETE ==="
         )
 
         print(
-            "name:",
-            result.get("name"),
+            "folder:",
+            root_folder_name,
         )
 
         print(
-            "size:",
-            result.get("size"),
-        )
-
-        print(
-            "webViewLink:",
-            result.get(
-                "webViewLink"
-            ),
+            "files:",
+            len(test_files),
         )
 
         print(
