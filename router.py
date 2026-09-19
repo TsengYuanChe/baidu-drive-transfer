@@ -6,7 +6,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 
-from main import run_transfer
+from main import TransferCancelled, run_transfer
 
 
 app = FastAPI(
@@ -22,7 +22,7 @@ class CreateTransferRequest(BaseModel):
 
 class TransferJob(BaseModel):
     job_id: str
-    status: Literal["pending", "running", "completed", "failed"]
+    status: Literal["pending", "running", "completed", "failed", "cancelled"]
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -43,6 +43,7 @@ class TransferJob(BaseModel):
 
 
 jobs: dict[str, TransferJob] = {}
+cancel_events: dict[str, threading.Event] = {}
 active_job_id: str | None = None
 job_lock = threading.Lock()
         
@@ -57,6 +58,7 @@ def run_transfer_worker(
     with job_lock:
         job = jobs[job_id]
         job.status = "running"
+        cancel_event = cancel_events[job_id]
         job.started_at = datetime.now(timezone.utc)
 
     def update_progress(progress) -> None:
@@ -90,11 +92,19 @@ def run_transfer_worker(
             google_folder_url=google_folder_url,
             mode="all",
             progress_callback=update_progress,
+            cancel_event=cancel_event,
         )
 
         with job_lock:
             job = jobs[job_id]
             job.status = "completed"
+            job.finished_at = datetime.now(timezone.utc)
+            
+    except TransferCancelled:
+        with job_lock:
+            job = jobs[job_id]
+            job.status = "cancelled"
+            job.error = None
             job.finished_at = datetime.now(timezone.utc)
 
     except Exception as exc:
@@ -133,6 +143,8 @@ def create_transfer(payload: CreateTransferRequest):
         )
 
         jobs[job_id] = job
+        # 每個 job 都建立自己的 cancel event
+        cancel_events[job_id] = threading.Event()
         active_job_id = job_id
 
     thread = threading.Thread(
@@ -180,3 +192,33 @@ def get_transfer(job_id: str):
             )
 
         return job
+    
+    
+@app.post("/transfers/{job_id}/cancel")
+def cancel_transfer(job_id: str):
+    with job_lock:
+        job = jobs.get(job_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Transfer job not found.",
+            )
+
+        if job.status not in ("pending", "running"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Transfer job is already {job.status}.",
+            )
+
+        cancel_event = cancel_events[job_id]
+        cancel_event.set()
+
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "cancel_requested": True,
+        }
+        
+        
+    

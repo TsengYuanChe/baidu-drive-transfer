@@ -11,10 +11,18 @@ permissions:
 
 env:
   PROJECT_ID: andessence-backend-service
-  REGION: asia-east1
+
+  # Artifact Registry 仍然放在 asia-east1
+  AR_REGION: asia-east1
+
+  # Cloud Run 改成新的 region
+  RUN_REGION: asia-northeast1
+
   REPOSITORY: baidu-drive-transfer
   IMAGE: baidu-drive-transfer
-  SERVICE: baidu-drive-transfer
+
+  # 新的 Cloud Run service
+  SERVICE: baidu-drive-transfer-test
 
 jobs:
   deploy:
@@ -28,9 +36,9 @@ jobs:
         id: auth
         uses: google-github-actions/auth@v3
         with:
-            workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-            service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
-            token_format: access_token
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: access_token
 
       - name: Set up Google Cloud
         uses: google-github-actions/setup-gcloud@v3
@@ -38,14 +46,13 @@ jobs:
       - name: Login to Artifact Registry
         uses: docker/login-action@v3
         with:
-            registry: ${{ env.REGION }}-docker.pkg.dev
-            username: oauth2accesstoken
-            password: ${{ steps.auth.outputs.access_token }}
-                --quiet
+          registry: ${{ env.AR_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
 
       - name: Build image
         run: |
-          IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
+          IMAGE_URI=${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
 
           docker build \
             --platform linux/amd64 \
@@ -55,16 +62,16 @@ jobs:
 
       - name: Push image
         run: |
-          IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
+          IMAGE_URI=${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
 
           docker push $IMAGE_URI:${{ github.sha }}
           docker push $IMAGE_URI:latest
 
       - name: Deploy to Cloud Run
         run: |
-          IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
+          IMAGE_URI=${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}
 
           gcloud run deploy ${{ env.SERVICE }} \
             --image $IMAGE_URI:${{ github.sha }} \
-            --region ${{ env.REGION }} \
+            --region ${{ env.RUN_REGION }} \
             --quiet

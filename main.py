@@ -2,6 +2,7 @@ import argparse
 import mimetypes
 import os
 import time
+import threading
 from typing import Callable
 from dataclasses import dataclass
 
@@ -91,6 +92,10 @@ class TransferProgress:
             self.google_uploaded_bytes
             / elapsed
         )
+        
+        
+class TransferCancelled(Exception):
+    pass
 
 
 def format_bytes(value: int) -> str:
@@ -401,6 +406,7 @@ def stream_baidu_to_google(
     filename: str,
     file_size: int,
     progress: TransferProgress,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     uploaded = 0
     downloaded = 0
@@ -417,6 +423,8 @@ def stream_baidu_to_google(
         for data in baidu_response.iter_bytes(
             chunk_size=BAIDU_READ_CHUNK_SIZE
         ):
+            check_cancelled(cancel_event)
+            
             buffer.extend(data)
             downloaded += len(data)
             
@@ -433,6 +441,8 @@ def stream_baidu_to_google(
                 )
 
             while len(buffer) >= CHUNK_SIZE:
+                check_cancelled(cancel_event)
+                
                 chunk = bytes(buffer[:CHUNK_SIZE])
                 del buffer[:CHUNK_SIZE]
 
@@ -456,6 +466,8 @@ def stream_baidu_to_google(
         print_job_progress(progress)
 
         if buffer:
+            check_cancelled(cancel_event)
+            
             chunk = bytes(buffer)
 
             result = upload_google_chunk(
@@ -484,11 +496,19 @@ def batched(items: list[dict], batch_size: int):
         yield items[start:start + batch_size]
 
 
+def check_cancelled(
+    cancel_event: threading.Event | None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise TransferCancelled()
+
+
 def run_transfer(
     baidu_url: str,
     google_folder_url: str,
     mode: str,
     progress_callback: Callable[[TransferProgress], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     cookie = os.environ.get("BAIDU_COOKIE")
     if not cookie:
@@ -653,6 +673,8 @@ def run_transfer(
             selected_files,
             DLINK_BATCH_SIZE,
         ):
+            check_cancelled(cancel_event)
+            
             # Refresh sign/timestamp for each small batch so
             # long-running transfers do not depend on one
             # download configuration for the whole job.
@@ -716,6 +738,8 @@ def run_transfer(
                 refresh_google_credentials(
                     google_credentials
                 )
+                
+                check_cancelled(cancel_event)
 
                 upload_url = (
                     create_google_resumable_session(
@@ -738,6 +762,7 @@ def run_transfer(
                     filename=filename,
                     file_size=file_size,
                     progress=progress,
+                    cancel_event=cancel_event
                 )
 
                 returned_size = result.get("size")
