@@ -33,6 +33,15 @@ CHUNK_SIZE = 8 * 1024 * 1024
 BAIDU_READ_CHUNK_SIZE = 100 * 1024
 DLINK_BATCH_SIZE = 1
 
+MAX_FILE_ATTEMPTS = 3
+FILE_RETRY_DELAYS = (2, 5)
+
+RETRYABLE_TRANSFER_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    httpx.TransportError,
+)
+
 
 @dataclass
 class TransferProgress:
@@ -669,118 +678,185 @@ def run_transfer(
             first_print=True,
         )
 
+        
+
         for batch in batched(
             selected_files,
             DLINK_BATCH_SIZE,
         ):
             check_cancelled(cancel_event)
-            
-            # Refresh sign/timestamp for each small batch so
-            # long-running transfers do not depend on one
-            # download configuration for the whole job.
-            sign, timestamp = get_download_config(
-                client=client,
-                raw_surl=raw_surl,
-                bdstoken=metadata["bdstoken"],
-            )
-
-            download_items = get_download_links(
-                client=client,
-                file_infos=batch,
-                sign=sign,
-                timestamp=timestamp,
-                bdstoken=metadata["bdstoken"],
-                js_token=metadata["js_token"],
-                sekey=sekey,
-                share_uk=metadata["share_uk"],
-                share_id=metadata["share_id"],
-            )
-
-            if len(download_items) != len(batch):
-                raise RuntimeError(
-                    "Baidu download link count mismatch: "
-                    f"requested={len(batch)}, "
-                    f"returned={len(download_items)}"
-                )
-
-            download_items_by_fsid = {
-                str(item["fs_id"]): item
-                for item in download_items
-            }
 
             for file_info in batch:
                 fs_id = str(file_info["fs_id"])
                 filename = file_info["server_filename"]
                 file_size = int(file_info["size"])
 
-                download_item = (
-                    download_items_by_fsid.get(fs_id)
-                )
-
-                if not download_item:
-                    raise RuntimeError(
-                        "Baidu download item missing: "
-                        f"fs_id={fs_id}, file={filename}"
-                    )
-
-                dlink = download_item.get("dlink")
-                if not dlink:
-                    raise RuntimeError(
-                        f"Baidu dlink missing: {filename}"
-                    )
-
-                mime_type, _ = mimetypes.guess_type(
-                    filename
-                )
+                mime_type, _ = mimetypes.guess_type(filename)
                 if not mime_type:
                     mime_type = "application/octet-stream"
 
-                refresh_google_credentials(
-                    google_credentials
-                )
+                for attempt in range(1, MAX_FILE_ATTEMPTS + 1):
+                    check_cancelled(cancel_event)
+
+                    baidu_bytes_before = (
+                        progress.baidu_downloaded_bytes
+                    )
+                    baidu_files_before = (
+                        progress.baidu_completed_files
+                    )
+                    google_bytes_before = (
+                        progress.google_uploaded_bytes
+                    )
+                    google_files_before = (
+                        progress.google_completed_files
+                    )
+
+                    try:
+                        print(
+                            f"\nTransfer file: {filename} "
+                            f"(attempt {attempt}/{MAX_FILE_ATTEMPTS})"
+                        )
+
+                        # Get a fresh Baidu download configuration
+                        # for every attempt.
+                        sign, timestamp = get_download_config(
+                            client=client,
+                            raw_surl=raw_surl,
+                            bdstoken=metadata["bdstoken"],
+                        )
+
+                        download_items = get_download_links(
+                            client=client,
+                            file_infos=[file_info],
+                            sign=sign,
+                            timestamp=timestamp,
+                            bdstoken=metadata["bdstoken"],
+                            js_token=metadata["js_token"],
+                            sekey=sekey,
+                            share_uk=metadata["share_uk"],
+                            share_id=metadata["share_id"],
+                        )
+
+                        if len(download_items) != 1:
+                            raise RuntimeError(
+                                "Baidu download link count mismatch: "
+                                "requested=1, "
+                                f"returned={len(download_items)}"
+                            )
+
+                        download_items_by_fsid = {
+                            str(item["fs_id"]): item
+                            for item in download_items
+                        }
+
+                        download_item = (
+                            download_items_by_fsid.get(fs_id)
+                        )
+
+                        if not download_item:
+                            raise RuntimeError(
+                                "Baidu download item missing: "
+                                f"fs_id={fs_id}, file={filename}"
+                            )
+
+                        dlink = download_item.get("dlink")
+                        if not dlink:
+                            raise RuntimeError(
+                                f"Baidu dlink missing: {filename}"
+                            )
+
+                        refresh_google_credentials(
+                            google_credentials
+                        )
+
+                        check_cancelled(cancel_event)
+
+                        # Always create a new resumable session
+                        # for a new file attempt.
+                        upload_url = (
+                            create_google_resumable_session(
+                                access_token=(
+                                    google_credentials.token
+                                ),
+                                folder_id=(
+                                    google_root_folder_id
+                                ),
+                                filename=filename,
+                                file_size=file_size,
+                                mime_type=mime_type,
+                            )
+                        )
+
+                        result = stream_baidu_to_google(
+                            baidu_client=client,
+                            dlink=dlink,
+                            upload_url=upload_url,
+                            filename=filename,
+                            file_size=file_size,
+                            progress=progress,
+                            cancel_event=cancel_event,
+                        )
+
+                        returned_size = result.get("size")
+
+                        if (
+                            returned_size is not None
+                            and int(returned_size) != file_size
+                        ):
+                            raise RuntimeError(
+                                "Google file size mismatch: "
+                                f"file={filename}, "
+                                f"expected={file_size}, "
+                                f"actual={returned_size}"
+                            )
+
+                        progress.google_completed_files += 1
+                        print_job_progress(progress)
+
+                        # File completed successfully.
+                        break
+
+                    except TransferCancelled:
+                        raise
+
+                    except RETRYABLE_TRANSFER_EXCEPTIONS as exc:
+                        # Roll back progress from this failed attempt.
+                        progress.baidu_downloaded_bytes = (
+                            baidu_bytes_before
+                        )
+                        progress.baidu_completed_files = (
+                            baidu_files_before
+                        )
+                        progress.google_uploaded_bytes = (
+                            google_bytes_before
+                        )
+                        progress.google_completed_files = (
+                            google_files_before
+                        )
+
+                        print_job_progress(progress)
+
+                        if attempt >= MAX_FILE_ATTEMPTS:
+                            raise
+
+                        delay = FILE_RETRY_DELAYS[attempt - 1]
+
+                        print(
+                            f"\nTemporary transfer error: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        print(
+                            f"Retrying {filename} "
+                            f"in {delay} seconds..."
+                        )
+
+                        # Make cancellation responsive while waiting.
+                        if (
+                            cancel_event is not None
+                            and cancel_event.wait(delay)
+                        ):
+                            raise TransferCancelled()
                 
-                check_cancelled(cancel_event)
-
-                upload_url = (
-                    create_google_resumable_session(
-                        access_token=(
-                            google_credentials.token
-                        ),
-                        folder_id=(
-                            google_root_folder_id
-                        ),
-                        filename=filename,
-                        file_size=file_size,
-                        mime_type=mime_type,
-                    )
-                )
-
-                result = stream_baidu_to_google(
-                    baidu_client=client,
-                    dlink=dlink,
-                    upload_url=upload_url,
-                    filename=filename,
-                    file_size=file_size,
-                    progress=progress,
-                    cancel_event=cancel_event
-                )
-
-                returned_size = result.get("size")
-                if (
-                    returned_size is not None
-                    and int(returned_size) != file_size
-                ):
-                    raise RuntimeError(
-                        "Google file size mismatch: "
-                        f"file={filename}, "
-                        f"expected={file_size}, "
-                        f"actual={returned_size}"
-                    )
-
-                progress.google_completed_files += 1
-
-                print_job_progress(progress)
-
         elapsed = time.monotonic() - progress.started_at
 
         print("\n=== TRANSFER COMPLETE ===")
