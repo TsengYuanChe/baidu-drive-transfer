@@ -29,7 +29,7 @@ GOOGLE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 
 CHUNK_SIZE = 8 * 1024 * 1024
 BAIDU_READ_CHUNK_SIZE = 100 * 1024
-DLINK_BATCH_SIZE = 3
+DLINK_BATCH_SIZE = 1
 
 
 @dataclass
@@ -191,6 +191,134 @@ def create_google_folder(
     response.raise_for_status()
     return response.json()
 
+
+def list_google_filenames(
+    access_token: str,
+    folder_id: str,
+) -> set[str]:
+    filenames: set[str] = set()
+    page_token: str | None = None
+
+    while True:
+        params = {
+            "q": (
+                f"'{folder_id}' in parents "
+                "and trashed = false"
+            ),
+            "fields": (
+                "nextPageToken,"
+                "files(id,name)"
+            ),
+            "pageSize": 1000,
+        }
+
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = requests.get(
+            GOOGLE_FILES_URL,
+            params=params,
+            headers={
+                "Authorization": (
+                    f"Bearer {access_token}"
+                ),
+            },
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        for item in data.get("files", []):
+            name = item.get("name")
+
+            if name:
+                filenames.add(name)
+
+        page_token = data.get(
+            "nextPageToken"
+        )
+
+        if not page_token:
+            break
+
+    return filenames
+
+
+def find_google_folder(
+    access_token: str,
+    folder_name: str,
+    parent_folder_id: str,
+) -> dict | None:
+    safe_name = folder_name.replace(
+        "'",
+        "\\'",
+    )
+
+    response = requests.get(
+        GOOGLE_FILES_URL,
+        params={
+            "q": (
+                f"'{parent_folder_id}' in parents "
+                f"and name = '{safe_name}' "
+                "and mimeType = "
+                "'application/vnd.google-apps.folder' "
+                "and trashed = false"
+            ),
+            "fields": "files(id,name)",
+            "pageSize": 10,
+        },
+        headers={
+            "Authorization": (
+                f"Bearer {access_token}"
+            ),
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    files = response.json().get(
+        "files",
+        [],
+    )
+
+    if not files:
+        return None
+
+    return files[0]
+
+
+def get_or_create_google_folder(
+    access_token: str,
+    folder_name: str,
+    parent_folder_id: str,
+) -> dict:
+    existing = find_google_folder(
+        access_token=access_token,
+        folder_name=folder_name,
+        parent_folder_id=parent_folder_id,
+    )
+
+    if existing:
+        print(
+            "Google folder exists:",
+            folder_name,
+        )
+        return existing
+
+    print(
+        "Creating Google folder:",
+        folder_name,
+    )
+
+    return create_google_folder(
+        access_token=access_token,
+        folder_name=folder_name,
+        parent_folder_id=parent_folder_id,
+    )
+    
 
 def create_google_resumable_session(
     access_token: str,
@@ -375,9 +503,24 @@ def run_transfer(
             "application/json, "
             "text/javascript, */*; q=0.01"
         ),
+        "Accept-Language": (
+            "en-US,en;q=0.9,ja;q=0.8,"
+            "zh-TW;q=0.7,zh;q=0.6"
+        ),
         "Origin": "https://pan.baidu.com",
         "Referer": baidu_url,
         "X-Requested-With": "XMLHttpRequest",
+        "DNT": "1",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": (
+            '"Not=A?Brand";v="99", '
+            '"Google Chrome";v="151", '
+            '"Chromium";v="151"'
+        ),
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
         "Cookie": cookie,
     }
 
@@ -419,7 +562,7 @@ def run_transfer(
                 "No files found in Baidu share"
             )
 
-        selected_files = (
+        candidate_files = (
             all_files[:1]
             if mode == "test"
             else all_files
@@ -435,14 +578,45 @@ def run_transfer(
             google_credentials
         )
 
-        google_root_folder = create_google_folder(
-            access_token=google_credentials.token,
-            folder_name=root_folder_name,
-            parent_folder_id=google_parent_folder_id,
+        google_root_folder = (
+            get_or_create_google_folder(
+                access_token=google_credentials.token,
+                folder_name=root_folder_name,
+                parent_folder_id=google_parent_folder_id,
+            )
         )
 
         google_root_folder_id = (
             google_root_folder["id"]
+        )
+        
+        existing_google_files = (
+            list_google_filenames(
+                access_token=google_credentials.token,
+                folder_id=google_root_folder_id,
+            )
+        )
+
+        print(
+            "Existing Google files:",
+            len(existing_google_files),
+        )
+        
+        selected_files = [
+            file_info
+            for file_info in candidate_files
+            if file_info["server_filename"]
+            not in existing_google_files
+        ]
+        
+        skipped_files = (
+            len(candidate_files)
+            - len(selected_files)
+        )
+
+        print(
+            "Skipped existing files:",
+            skipped_files,
         )
 
         total_bytes = sum(
