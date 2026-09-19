@@ -2,6 +2,7 @@ import argparse
 import mimetypes
 import os
 import time
+from typing import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -37,6 +38,7 @@ class TransferProgress:
     total_files: int
     total_bytes: int
     started_at: float
+    callback: Callable[["TransferProgress"], None] | None = None
 
     baidu_downloaded_bytes: int = 0
     baidu_completed_files: int = 0
@@ -158,6 +160,9 @@ def print_job_progress(
     print("\r\033[K" + google_line)
 
     print(end="", flush=True)
+    
+    if progress.callback is not None:
+        progress.callback(progress)
 
 
 def refresh_google_credentials(credentials) -> None:
@@ -483,6 +488,7 @@ def run_transfer(
     baidu_url: str,
     google_folder_url: str,
     mode: str,
+    progress_callback: Callable[[TransferProgress], None] | None = None,
 ) -> None:
     cookie = os.environ.get("BAIDU_COOKIE")
     if not cookie:
@@ -628,6 +634,7 @@ def run_transfer(
             total_files=len(selected_files),
             total_bytes=total_bytes,
             started_at=time.monotonic(),
+            callback=progress_callback,
         )
 
         print("\n=== TRANSFER START ===")
