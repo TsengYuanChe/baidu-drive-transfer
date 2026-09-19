@@ -1,5 +1,6 @@
 import mimetypes
 import re
+import os
 import sys
 from pathlib import Path
 
@@ -14,8 +15,27 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-CREDENTIALS_FILE = Path("credentials.json")
-TOKEN_FILE = Path("token.json")
+CREDENTIALS_FILE = Path(
+    os.getenv(
+        "GOOGLE_CREDENTIALS_FILE",
+        "credentials.json",
+    )
+)
+
+TOKEN_FILE = Path(
+    os.getenv(
+        "GOOGLE_TOKEN_FILE",
+        "token.json",
+    )
+)
+
+TOKEN_WRITABLE = (
+    os.getenv(
+        "GOOGLE_TOKEN_WRITABLE",
+        "true",
+    ).lower()
+    == "true"
+)
 
 
 def parse_folder_id(folder_url: str) -> str:
@@ -83,10 +103,11 @@ def get_credentials() -> Credentials:
             port=0,
         )
 
-    TOKEN_FILE.write_text(
-        creds.to_json(),
-        encoding="utf-8",
-    )
+    if TOKEN_WRITABLE:
+        TOKEN_FILE.write_text(
+            creds.to_json(),
+            encoding="utf-8",
+        )
 
     return creds
 
