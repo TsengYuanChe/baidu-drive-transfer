@@ -26,6 +26,15 @@ from google_drive_upload import (
 )
 
 
+        
+class TransferCancelled(Exception):
+    pass
+
+
+class RetryableTransferError(Exception):
+    pass
+
+
 GOOGLE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 
@@ -34,9 +43,10 @@ BAIDU_READ_CHUNK_SIZE = 100 * 1024
 DLINK_BATCH_SIZE = 1
 
 MAX_FILE_ATTEMPTS = 3
-FILE_RETRY_DELAYS = (2, 5)
+FILE_RETRY_DELAYS = (5, 30)
 
 RETRYABLE_TRANSFER_EXCEPTIONS = (
+    RetryableTransferError,
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     httpx.TransportError,
@@ -101,10 +111,6 @@ class TransferProgress:
             self.google_uploaded_bytes
             / elapsed
         )
-        
-        
-class TransferCancelled(Exception):
-    pass
 
 
 def format_bytes(value: int) -> str:
@@ -401,6 +407,12 @@ def upload_google_chunk(
 
     if response.status_code in (200, 201):
         return response.json()
+    
+    if response.status_code in (429, 500, 502, 503, 504):
+        raise RetryableTransferError(
+            "Google chunk upload temporarily failed: "
+            f"HTTP {response.status_code}"
+        )
 
     raise RuntimeError(
         "Google chunk upload failed: "
