@@ -789,6 +789,29 @@ def main() -> None:
         )
 
         response.raise_for_status()
+        
+        # TEMP DEBUG: inspect share page returned to Cloud Run
+        print("=== SHARE PAGE DIAGNOSTIC ===")
+        print("status:", response.status_code)
+        print("url:", response.url)
+        print(
+            "content-type:",
+            response.headers.get("content-type"),
+        )
+        print("html length:", len(response.text))
+        print(
+            "has file_list:",
+            "file_list" in response.text,
+        )
+        print(
+            "has yunData:",
+            "window.yunData" in response.text,
+        )
+        print(
+            "has loginstate:",
+            "loginstate" in response.text,
+        )
+        print("=============================")
 
         metadata = extract_share_metadata(
             response.text
