@@ -69,7 +69,7 @@ def extract_share_metadata(
 ) -> dict[str, str]:
     
     file_list_match = re.search(
-        r'"file_list"\s*:\s*(\[[\s\S]*?\])\s*,',
+        r'"file_list"\s*:\s*',
         html,
     )
 
@@ -78,9 +78,39 @@ def extract_share_metadata(
             "Could not find file_list"
         )
 
-    file_list = json.loads(
-        file_list_match.group(1)
-    )
+    try:
+        file_list_value, _ = json.JSONDecoder().raw_decode(
+            html[file_list_match.end():]
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Could not parse file_list"
+        ) from exc
+
+    # Old format:
+    # "file_list": [...]
+    if isinstance(file_list_value, list):
+        file_list = file_list_value
+
+    # New format:
+    # "file_list": {
+    #     "errno": 0,
+    #     "list": [...]
+    # }
+    elif isinstance(file_list_value, dict):
+        errno = file_list_value.get("errno")
+
+        if errno not in (None, 0):
+            raise RuntimeError(
+                f"file_list returned errno={errno}"
+            )
+
+        file_list = file_list_value.get("list", [])
+
+    else:
+        raise RuntimeError(
+            "Unexpected file_list format"
+        )
 
     if not file_list:
         raise RuntimeError(
@@ -97,7 +127,7 @@ def extract_share_metadata(
         )
 
     loginstate_match = re.search(
-        r"""loginstate\s*:\s*['"]?(\d+)['"]?""",
+        r"""["']?loginstate["']?\s*:\s*["']?(\d+)["']?""",
         html,
     )
 
@@ -114,17 +144,17 @@ def extract_share_metadata(
         )
 
     bdstoken_match = re.search(
-        r"""bdstoken\s*:\s*['"]([^'"]+)['"]""",
+        r"""["']?bdstoken["']?\s*:\s*["']([^"']+)["']""",
         html,
     )
 
     share_uk_match = re.search(
-        r"""share_uk\s*:\s*['"]([^'"]+)['"]""",
+        r"""["']?share_uk["']?\s*:\s*["']?([^"',}\s]+)["']?""",
         html,
     )
 
     share_id_match = re.search(
-        r"""shareid\s*:\s*['"]([^'"]+)['"]""",
+        r"""["']?shareid["']?\s*:\s*["']?([^"',}\s]+)["']?""",
         html,
     )
 
@@ -143,18 +173,33 @@ def extract_share_metadata(
             "Could not find shareid"
         )
 
+    # Legacy format:
+    # eval(decodeURIComponent("function%20fn..."))
     encoded_script_match = re.search(
-        r"""eval\(decodeURIComponent\(['"]([^'"]+)['"]\)\)""",
+        r"""eval\(decodeURIComponent\(["']([^"']+)["']\)\)""",
         html,
     )
 
-    if not encoded_script_match:
-        raise RuntimeError(
-            "Could not find jsToken script"
+    if encoded_script_match:
+        encoded_script = encoded_script_match.group(1)
+
+    else:
+        # New format:
+        # "jsToken":"function%20fn..."
+        encoded_script_match = re.search(
+            r"""["']jsToken["']\s*:\s*["']([^"']+)["']""",
+            html,
         )
 
+        if not encoded_script_match:
+            raise RuntimeError(
+                "Could not find jsToken script"
+            )
+
+        encoded_script = encoded_script_match.group(1)
+
     decoded_script = unquote(
-        encoded_script_match.group(1)
+        encoded_script
     )
 
     js_token_match = re.search(
@@ -772,33 +817,57 @@ def main() -> None:
         # Authenticated share page
         # ----------------------------------------------
 
-        print("=== SHARE PAGE ===")
+        print("=== SHARE PAGE STEP 1 ===")
 
         response = client.get(
-            share_url
+            share_url,
+            follow_redirects=False,
         )
-
-        print(
-            "status:",
-            response.status_code,
-        )
+        
+        print("status:", response.status_code)
+        print("location:", response.headers.get("location"))
 
         print(
             "final url:",
             response.url,
         )
-
-        response.raise_for_status()
         
-        # TEMP DEBUG: inspect share page returned to Cloud Run
-        print("=== SHARE PAGE DIAGNOSTIC ===")
+        # Manually follow the first redirect.
+        location = response.headers.get("location")
+
+        if not location:
+            raise RuntimeError(
+                "Share page did not return redirect location"
+            )
+
+        if location.startswith("/"):
+            redirect_url = (
+                f"https://pan.baidu.com{location}"
+            )
+        else:
+            redirect_url = location
+
+        print("=== SHARE PAGE STEP 2 ===")
+
+        response = client.get(
+            redirect_url,
+            follow_redirects=False,
+        )
+
         print("status:", response.status_code)
         print("url:", response.url)
+        print(
+            "location:",
+            response.headers.get("location"),
+        )
         print(
             "content-type:",
             response.headers.get("content-type"),
         )
-        print("html length:", len(response.text))
+        print(
+            "html length:",
+            len(response.text),
+        )
         print(
             "has file_list:",
             "file_list" in response.text,
@@ -811,7 +880,35 @@ def main() -> None:
             "has loginstate:",
             "loginstate" in response.text,
         )
-        print("=============================")
+        
+        # TEMP DEBUG:
+        # Do not parse yet if the second request is another redirect.
+        if response.is_redirect:
+            raise RuntimeError(
+                "Second share request redirected again: "
+                f"{response.headers.get('location')}"
+            )
+
+        response.raise_for_status()
+        
+        # TEMP DEBUG: inspect file_list structure
+        file_list_pos = response.text.find('"file_list"')
+
+        print("=== FILE_LIST DEBUG ===")
+        print("position:", file_list_pos)
+
+        if file_list_pos != -1:
+            start = max(0, file_list_pos - 100)
+            end = min(
+                len(response.text),
+                file_list_pos + 2000,
+            )
+
+            print(
+                response.text[start:end]
+            )
+
+        print("=======================")
 
         metadata = extract_share_metadata(
             response.text
