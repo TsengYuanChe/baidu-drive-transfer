@@ -67,10 +67,33 @@ def get_verify_surl(raw_surl: str) -> str:
 def extract_share_metadata(
     html: str,
 ) -> dict[str, str]:
-    
+    print(
+        "=== EXTRACT METADATA V2 ===",
+        flush=True,
+    )
+    print(
+        "html length:",
+        len(html),
+        flush=True,
+    )
+    print(
+        "has file_list:",
+        '"file_list"' in html,
+        flush=True,
+    )
+    print(
+        "has yunData:",
+        "window.yunData" in html,
+        flush=True,
+    )
     file_list_match = re.search(
         r'"file_list"\s*:\s*',
         html,
+    )
+    print(
+        "file_list_match:",
+        file_list_match is not None,
+        flush=True,
     )
 
     if not file_list_match:
