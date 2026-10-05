@@ -26,6 +26,14 @@ app.add_middleware(
     allow_headers=["Content-Type", "Accept"],
 )
 
+APP_VERSION = "2026-10-05-filelist-v2"
+
+@app.get("/version")
+def get_version():
+    return {
+        "version": APP_VERSION,
+    }
+
 
 class CreateTransferRequest(BaseModel):
     baidu_url: str
