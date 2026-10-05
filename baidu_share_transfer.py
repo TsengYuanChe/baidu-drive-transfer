@@ -98,7 +98,7 @@ def extract_share_metadata(
 
     if not file_list_match:
         raise RuntimeError(
-            "Could not find file_list"
+            "Could not find file_list at 20261005"
         )
 
     try:
