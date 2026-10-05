@@ -576,7 +576,39 @@ def run_transfer(
         follow_redirects=True,
         timeout=30.0,
     ) as client:
-        share_response = client.get(baidu_url)
+        share_response = client.get(
+            baidu_url,
+            follow_redirects=False,
+        )
+        
+        if share_response.is_redirect:
+            location = share_response.headers.get(
+                "location"
+            )
+
+            if not location:
+                raise RuntimeError(
+                    "Share page redirect has no location"
+                )
+
+            if location.startswith("/"):
+                redirect_url = (
+                    f"https://pan.baidu.com{location}"
+                )
+            else:
+                redirect_url = location
+
+            share_response = client.get(
+                redirect_url,
+                follow_redirects=False,
+            )
+
+        if share_response.is_redirect:
+            raise RuntimeError(
+                "Unexpected share page redirect: "
+                f"{share_response.headers.get('location')}"
+            )
+        
         share_response.raise_for_status()
 
         metadata = extract_share_metadata(
